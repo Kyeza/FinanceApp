@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Local databases
+*.sqlite3
+*.sqlite3-*
+
+# Generated static files and uploaded media
+staticfiles/
+media/
+
+# Logs and backups
+logs/
+*.log
+backups/
+
+# Test coverage and tool caches
+.coverage*
+coverage.xml
+htmlcov/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Security reports
+bandit-report.json
+pip-audit-report.json
+
+# IDE settings
+.idea/
+.vscode/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
