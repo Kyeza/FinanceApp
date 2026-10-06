@@ -1,0 +1,10 @@
+-r base.txt
+bandit==1.9.4
+coverage==7.16.2
+django-debug-toolbar==8.0.0
+factory-boy==3.3.3
+Faker==40.40.0
+pip-audit==2.10.1
+pip-tools==7.6.1
+pylint==4.1.2
+ruff==0.16.9

@@ -1,0 +1,9 @@
+# Compile with hashes to help make these reproducible with CI.
+# Hashes verify downloaded package files
+Django==6.1.1
+django-environ==0.14.0
+djangorestframework==3.18.1
+gunicorn==26.2.0
+psycopg[binary]==3.3.6
+redis==8.1.0
+whitenoise==6.12.0
