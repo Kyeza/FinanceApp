@@ -18,8 +18,12 @@ from django.conf import settings
 from django.contrib import admin
 from django.urls import path
 
+from financeapp.health import readiness, liveness
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path("health/", readiness, name="readiness"),
+    path("health/live/", liveness, name="liveness")
 ]
 
 if settings.ENABLE_DEBUG_TOOLBAR:
