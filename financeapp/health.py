@@ -71,9 +71,9 @@ def readiness(request: HttpRequest) -> JsonResponse:
             raise RedisError("Cache round-trip failed")
     except RedisError:
         logger.error("Cache readiness check failed", exc_info=True)
-        return JsonResponse({"status": "unhealthy"})
+        return JsonResponse({"status": "unhealthy"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
 
-    return JsonResponse({"status": "healthy"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+    return JsonResponse({"status": "healthy"})
 
 
 @never_cache
