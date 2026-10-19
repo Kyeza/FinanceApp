@@ -10,22 +10,107 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 import os
+import sys
+from enum import StrEnum
 from pathlib import Path
+from typing import Final, Dict, Any
+from urllib.parse import urlsplit
+
+import environ
+from django.core.exceptions import ImproperlyConfigured
+from redis.backoff import NoBackoff
+from redis.retry import Retry
+
+
+class Environment(StrEnum):
+    """
+    Enumeration representing different application environments.
+
+    This enumeration is used to define constants for the various
+    environments in which the application can operate. It allows for
+    clear and standardized usage of environment names throughout the
+    codebase.
+
+    :cvar DEVELOPMENT: Represents the local development environment.
+    :type DEVELOPMENT: str
+    :cvar STAGING: Represents the staging environment for testing the same as production.
+    :type STAGING: str
+    :cvar PRODUCTION: Represents the production environment.
+    :type PRODUCTION: str
+    """
+    DEVELOPMENT = 'development'
+    STAGING = 'staging'
+    PRODUCTION = 'production'
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR:Final[Path] = Path(__file__).resolve().parent.parent
+MINIMUM_SECRET_KEY_LENGTH:Final[int] = 50
+MINIMUM_SECRET_UNIQUE_CHARACTERS:Final[int] = 5
+DEFAULT_CONNECTION_LIFETIME_SECONDS:Final[int] = 3600
+DATABASE_CONNECTION_TIMEOUT_SECONDS:Final[int] = 3600
+DEFAULT_HSTS_SECONDS:Final[int] = 31_536_000
+SMTP_TIMEOUT_SECONDS:Final[int] = 10
+LOG_LEVELS: Final[frozenset[str]] = frozenset(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'])
 
+# load environment variables from .env file only if not CI
+env = environ.Env()
+if env.bool("DJANGO_READ_DOT_ENV", default=True):
+    # CI sets this for False
+    # if a variable already exists in the real process environment, do not override it
+    environ.Env.read_env(BASE_DIR / ".env", override=False)
+
+# configure deployment environment
+try:
+    DEPLOYMENT_ENVIRONMENT = Environment(env("DJANGO_ENV", default="production"))
+except ValueError as error:
+    raise ImproperlyConfigured("DJANGO_ENV must be one of 'development', 'staging', or 'production'.") from error
+
+IS_PRODUCTION = DEPLOYMENT_ENVIRONMENT == Environment.PRODUCTION
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('SECRET_KEY', 'development-only')
+SECRET_KEY = env("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set.")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = env.bool("DJANGO_DEBUG", default=False)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=[])
+
+CSRF_TRUSTED_ORIGINS = env.list("DJANGO_CSRF_TRUSTED_ORIGINS", default=[])
+
+if IS_PRODUCTION:
+
+    # check production debug is not set to true
+    if DEBUG:
+        raise ImproperlyConfigured("DJANGO_DEBUG must be false in production")
+
+    # check production secret key is strong with minimum length, unique characters,
+    # and not starting with "django-insecure-"
+    if (
+            len(SECRET_KEY) < MINIMUM_SECRET_KEY_LENGTH
+            or len(set(SECRET_KEY)) < MINIMUM_SECRET_UNIQUE_CHARACTERS
+            or SECRET_KEY.startswith("django-insecure-")
+    ):
+        raise ImproperlyConfigured("Production requires a strong, randomly generated DJANGO_SECRET_KEY.")
+
+    # check production allowed hosts are not empty and don't contain wildcards
+    if not ALLOWED_HOSTS or any(host == "*" or host.startswith(".") for host in ALLOWED_HOSTS):
+        raise ImproperlyConfigured("Set explicit DJANGO_ALLOWED_HOSTS in production; wildcards are not allowed.")
+
+    # check production CSRF trusted origins are not empty and don't contain wildcards
+    if (
+            not CSRF_TRUSTED_ORIGINS
+            or any((
+                           urlsplit(origin).scheme != "https"
+                           or not urlsplit(origin).hostname
+                           or "*" in origin) for origin in CSRF_TRUSTED_ORIGINS
+                   )
+    ):
+        raise ImproperlyConfigured("Set explicit HTTPS DJANGO_CSRF_TRUSTED_ORIGINS in production.")
 
 
 # Application definition
@@ -41,6 +126,8 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # add white noise for static files
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -48,6 +135,22 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# configure django debug toolbar
+ENABLE_DEBUG_TOOLBAR = (
+    DEPLOYMENT_ENVIRONMENT == Environment.DEVELOPMENT
+    and DEBUG
+    and env.bool("DJANGO_ENABLE_DEBUG_TOOLBAR", default=False)
+    and "test" not in sys.argv # if not running tests, `python manage.py test`
+)
+
+if ENABLE_DEBUG_TOOLBAR:
+    INSTALLED_APPS.append('debug_toolbar')
+    MIDDLEWARE.insert(
+        MIDDLEWARE.index('django.contrib.sessions.middleware.SessionMiddleware'),
+        'debug_toolbar.middleware.DebugToolbarMiddleware',
+    )
+    INTERNAL_IPS = ['127.0.0.1', '::1']
 
 ROOT_URLCONF = 'financeapp.urls'
 
@@ -68,18 +171,28 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'financeapp.wsgi.application'
+ASGI_APPLICATION = 'financeapp.asgi.application'
 
 
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+if IS_PRODUCTION:
+    DATABASES = {
+        "default": env.db("DATABASE_URL")
     }
-}
+    if DATABASES["default"]["ENGINE"] != "django.db.backends.postgresql":
+        raise ImproperlyConfigured("Production DATABASE_URL must use PostgreSQL")
+else:
+    DATABASES = {
+        'default': env.db("DATABASE_URL", default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}")
+    }
 
+if DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql":
+    DATABASES["default"]["CONN_MAX_AGE"] = env.int("DATABASE_CONN_MAX_AGE",
+                                                   default=DEFAULT_CONNECTION_LIFETIME_SECONDS)
+    DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+    DATABASES["default"].setdefault("OPTIONS", {})["connect_timeout"] = DATABASE_CONNECTION_TIMEOUT_SECONDS
 
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
@@ -99,6 +212,34 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+# Redis
+REDIS_URL = env("REDIS_URL", default="")
+if IS_PRODUCTION and not REDIS_URL:
+    raise ImproperlyConfigured("REDIS_URL is required in production")
+
+if REDIS_URL:
+    # make sure it is a valid Redis url
+    if urlsplit(REDIS_URL).scheme not in ("redis", "rediss") or not urlsplit(REDIS_URL).hostname:
+        raise ImproperlyConfigured("REDIS_URL must a redis:// or rediss:// URL with a hostname")
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "financeapp",
+            "OPTIONS": {
+                "socket_connect_timeout": 2,
+                "socket_timeout": 2,
+                "retry": Retry(NoBackoff(), 0)
+            }
+        }
+    }
+else:
+    # we can use memcached in dev
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache"
+        }
+    }
 
 # Internationalization
 # https://docs.djangoproject.com/en/6.1/topics/i18n/
@@ -111,18 +252,95 @@ USE_I18N = True
 
 USE_TZ = True
 
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+}
+WHITENOISE_KEEP_ONLY_HASHED_FILES = True
+# we need to set up an explicit private-storage at some point
 
+# Django Rest framework
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+    ]
+}
+
+SESSION_COOKIE_SECURE = IS_PRODUCTION
+CSRF_COOKIE_SECURE = IS_PRODUCTION
+SESSION_COOKIE_HTTPONLY = True
+SECURE_SSL_REDIRECT = IS_PRODUCTION
+SECURE_REDIRECT_EXEMPT = [r"^health/(?:live/)?$"]
+SECURE_HSTS_SECONDS = env.int("DJANGO_SECURE_HSTS_SECONDS", default=DEFAULT_HSTS_SECONDS) if IS_PRODUCTION else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = False
+SECURE_HSTS_PRELOAD = False
+# These optional policies affect all subdomains or browser preload lists
+SILENCED_SYSTEM_CHECKS = ["security.W005", "security.W021"]
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+if IS_PRODUCTION:
+    # Only Nginx can reach the application port; it overwrites this client-supplied header.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
+MAILERS: Dict[str, Dict[str, Any]] = {
     'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        'BACKEND': 'django.core.mail.backends.smtp.EmailBackend'
+        if IS_PRODUCTION
+        else 'django.core.mail.backends.console.EmailBackend',
+    },
+}
+
+if IS_PRODUCTION:
+    MAILERS["default"]["OPTIONS"] = {
+        "host": env("SMTP_HOST", default="localhost"),
+        "port": env.int("SMTP_PORT", default=587),
+        "username": env("SMTP_USERNAME", default=""),
+        "password": env("SMTP_PASSWORD", default=""),
+        "use_tls": True,
+        "timeout": SMTP_TIMEOUT_SECONDS,
+    }
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="webmaster@localhost")
+
+# Logging
+LOG_LEVEL = env("DJANGO_LOG_LEVEL", default="INFO").upper()
+if LOG_LEVEL not in LOG_LEVELS:
+    raise ImproperlyConfigured("DJANGO_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL.")
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"standard": {"format": "{asctime} {levelname} {name} {message}", "style": "{"}},
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "formatter": "standard",
+        },
+    },
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+    "loggers": {
+        "django": {"handlers": [], "level": LOG_LEVEL, "propagate": True},
+        "django.server": {"handlers": [], "level": LOG_LEVEL, "propagate": True},
     },
 }
